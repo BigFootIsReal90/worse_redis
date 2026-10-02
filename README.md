@@ -1,2 +1,2 @@
 # worse_redis
-Redis made from instruction from codecrafter written in rust
+Redis written in rust made from instruction from codecrafter 
