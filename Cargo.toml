@@ -1,0 +1,13 @@
+[package]
+name = "redis"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio= {version="1.48.0",features=["full"]}
+memchr = "^2.7"
+bytes = "1.11.0"
+blart = "0.4.0"
+radixmap = "0.2.4"
+chrono = "0.4"
+library={path="/Users/ritam/random/library"}
