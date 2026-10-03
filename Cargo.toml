@@ -10,4 +10,4 @@ bytes = "1.11.0"
 blart = "0.4.0"
 radixmap = "0.2.4"
 chrono = "0.4"
-library={path="/Users/ritam/random/library"}
+library={git="https://github.com/BigFootIsReal90/radix_tree"}

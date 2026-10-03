@@ -197,6 +197,7 @@ checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 [[package]]
 name = "library"
 version = "0.1.0"
+source = "git+https://github.com/BigFootIsReal90/radix_tree#32f217611a96d9734d33b64ac298a0178a0c95af"
 dependencies = [
  "bytes",
 ]

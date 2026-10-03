@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+//use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::task::yield_now;
 
@@ -340,11 +341,18 @@ async fn EXEC(
 ) {
     dbg!("Inside EXEC");
     let stack1 = data_structure.stack.clone();
-    let mut stack = stack1.lock().unwrap();
-    dbg!("Inside EXEC STACK length", stack.len());
-    while stack.len() > 0 {
-        let query = stack.pop().unwrap();
-        dbg!("query", &query);
+    //dbg!("Inside EXEC STACK length", stack.len());
+    loop {
+        let query;
+        {
+            let mut stack = stack1.lock().unwrap();
+            if stack.len() == 0 {
+                return;
+            } else {
+                query = stack.pop().unwrap();
+            }
+        }
+        //dbg!("query", &query);
         Box::pin(logic(
             stream,
             query,
@@ -386,7 +394,7 @@ fn XADD(
     }
     todo!("add support for partial streamid");
 
-    let mut val = HashMap::new();
+    let mut val: HashMap<String, String> = HashMap::new();
 
     for i in (3..arr.len()).step_by(2) {
         val.insert(arr[i].clone(), arr[i + 1].clone());
@@ -435,7 +443,7 @@ async fn XREAD(
         println!("inside block of xread");
         let (key, blocking_time) = (&arr[4], &arr[2]);
         let given_stream_id;
-        let rt = rt.lock().unwrap().get(key).unwrap();
+        //let rt = rt.lock().unwrap().get(key).unwrap();
         {
             let last_stream_id = last_stream_id_map.lock().unwrap();
             if arr[5] == "$" {
