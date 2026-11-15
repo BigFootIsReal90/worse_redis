@@ -2,18 +2,19 @@ use bytes::{Bytes, BytesMut};
 use core::str;
 use memchr::memchr;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Debug;
 use std::hash::Hash;
-use std::net::TcpStream;
+use tokio::stream;
+
 //use std::convert::From;
-use library::radix_tree::{self, RadixTree, RadixTreeNode};
-use std::collections::BTreeMap;
+use library::radix_tree::{self, RadixTree, RadixTreeNode, StreamRes};
+
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 //use tokio::sync::Mutex;
 use tokio::sync::Notify;
-use tokio::task::yield_now;
 
 type RedisResult = Result<Option<(usize, RedisBufSplit)>, RESPError>;
 
@@ -29,9 +30,10 @@ enum KeyValue {
 }
 
 #[derive(Debug, Eq, Hash, PartialEq)]
-enum value {
-    Simple(RedisValueRef),
-    Expiry((RedisValueRef, u128)),
+enum Value {
+    Simple(String),
+    Expiry((String, Duration, Instant)),
+    None,
 }
 
 #[derive(Debug)]
@@ -58,7 +60,6 @@ pub enum RedisValueRef {
     NullArray,
     NullBulkString,
     ErrorMsg(Vec<u8>),
-    Stream(BTreeMap<RedisValueRef, RedisValueRef>),
 }
 
 //impl AsBytes for RedisValueRef {}
@@ -102,12 +103,13 @@ enum RESPError {
     BadArraySize(i64),
 }
 
-struct data_structure {
+struct DataStructure {
     rt: Arc<Mutex<HashMap<String, radix_tree::RadixTree<HashMap<String, String>>>>>,
     set: Arc<Mutex<HashSet<String>>>,
-    hashMap: Arc<Mutex<HashMap<String, String>>>,
+    hash_map: Arc<Mutex<HashMap<String, Value>>>,
     last_stream_id_map: Arc<Mutex<HashMap<String, String>>>,
-    stack: Arc<Mutex<Vec<Vec<String>>>>,
+    stack: Arc<Mutex<HashMap<String, Arc<Mutex<VecDeque<Vec<String>>>>>>>,
+    list: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
 }
 
 fn word(buf: &BytesMut, pos: usize) -> Option<(usize, BufSplit)> {
@@ -234,7 +236,7 @@ fn array(buf: &BytesMut, pos: usize) -> RedisResult {
             //println!("hello");
             Ok(Some((curr, RedisBufSplit::Array(res))))
         }
-        Some((pos, bad_num_elements)) => Err(RESPError::BadArraySize(bad_num_elements)),
+        Some((_pos, bad_num_elements)) => Err(RESPError::BadArraySize(bad_num_elements)),
     }
 }
 
@@ -272,12 +274,6 @@ fn encode(item: &RedisValueRef, dst: &mut BytesMut) {
         RedisValueRef::NullArray => dst.extend_from_slice("$-1\r\n".as_bytes()),
 
         RedisValueRef::NullBulkString => dst.extend_from_slice("$-1\r\n".as_bytes()),
-        RedisValueRef::Stream(s) => {
-            let temp = s
-                .get(&RedisValueRef::String(Bytes::from("stream_key")))
-                .unwrap();
-            encode(temp, dst)
-        }
     }
 }
 
@@ -289,6 +285,8 @@ fn generate_id(curr_stream_id: &str, last_stream_id: &str) -> String {
             .unwrap()
             .as_millis()
             .to_string();
+        res.push_str("-0");
+        return res;
     }
     let temp_arr1: Vec<_> = curr_stream_id.split("-").to_owned().collect();
     let temp_arr2: Vec<_> = last_stream_id.split("-").collect();
@@ -318,26 +316,260 @@ fn verify_stream(stream_id: &str, last_stream_id: &str) -> bool {
             return false;
         }
     }
+    //println!("returned true");
     return true;
 }
 
-fn SET(set: Arc<Mutex<HashSet<String>>>, val: String) {
-    set.lock().unwrap().insert(val);
+async fn stream_write(val: RedisValueRef, stream: &mut tokio::net::TcpStream) {
+    let dst = &mut BytesMut::new();
+    encode(&val, dst);
+    stream.write(dst).await.unwrap();
 }
 
-fn GET(set: &Arc<Mutex<HashSet<String>>>, val: String) -> Option<String> {
-    set.lock().unwrap().get(&val).cloned()
+fn get(data_structure: Arc<DataStructure>, arr: Vec<String>) -> Option<RedisValueRef> {
+    let mut hash_map = data_structure.hash_map.lock().unwrap();
+    let key = &arr[1];
+    dbg!("{:?}", &hash_map);
+    match hash_map.get(key).unwrap_or(&Value::None) {
+        Value::Simple(val) => {
+            return Some(RedisValueRef::String(Bytes::copy_from_slice(
+                val.as_bytes(),
+            )));
+        }
+        Value::Expiry((val, expiry, start)) => {
+            if Instant::now() > start.to_owned() + expiry.to_owned() {
+                hash_map.remove(&arr[1]);
+                return None;
+            } else {
+                return Some(RedisValueRef::String(Bytes::copy_from_slice(
+                    val.as_bytes(),
+                )));
+            }
+        }
+        Value::None => {
+            return None;
+        }
+    }
 }
 
-fn MULTI(stack: Arc<Mutex<Vec<Vec<String>>>>, val: Vec<String>) {
+fn set(data_structure: Arc<DataStructure>, arr: Vec<String>) -> Option<RedisValueRef> {
+    let data_structure = data_structure.clone();
+    let mut map = data_structure.hash_map.lock().unwrap();
+    let mut arr_iter = arr.into_iter();
+    arr_iter.next();
+    let (key, val) = (arr_iter.next().unwrap(), arr_iter.next().unwrap());
+    match arr_iter.next() {
+        Some(ex_or_px) => match ex_or_px.as_str() {
+            "PX" => {
+                map.insert(
+                    key,
+                    Value::Expiry((
+                        val,
+                        Duration::from_millis(arr_iter.next().unwrap().parse::<u64>().unwrap()),
+                        Instant::now(),
+                    )),
+                );
+                return Some(RedisValueRef::String(Bytes::from("OK".as_bytes())));
+            }
+            "EX" => {
+                map.insert(
+                    key,
+                    Value::Expiry((
+                        val,
+                        Duration::from_secs(arr_iter.next().unwrap().parse::<u64>().unwrap()),
+                        Instant::now(),
+                    )),
+                );
+                return Some(RedisValueRef::String(Bytes::from("OK".as_bytes())));
+            }
+            _ => None,
+        },
+        None => {
+            map.insert(key, Value::Simple(val));
+            return Some(RedisValueRef::String(Bytes::from("OK".as_bytes())));
+        }
+    }
+}
+
+fn rpush(
+    data_structure: Arc<DataStructure>,
+    arr: Vec<String>,
+    notifier: Arc<HashMap<String, Notify>>,
+) -> Option<RedisValueRef> {
+    let mut arr_iter = arr.into_iter();
+    arr_iter.next();
+    let key = arr_iter.next().unwrap();
+    let temp = data_structure.list.clone();
+    let mut temp2 = temp.lock().unwrap();
+    let list = temp2.entry(key).or_insert(VecDeque::new());
+    let notify2 = notifier.clone();
+    let notify = notify2.get("list").unwrap();
+    loop {
+        match arr_iter.next() {
+            Some(val) => {
+                list.push_back(val);
+                notify.notify_waiters();
+            }
+            None => {
+                break;
+            }
+        }
+    }
+    return Some(RedisValueRef::Int(list.len() as i64));
+}
+
+fn lpush(
+    data_structure: Arc<DataStructure>,
+    arr: Vec<String>,
+    notifier: Arc<HashMap<String, Notify>>,
+) -> Option<RedisValueRef> {
+    let mut arr_iter = arr.into_iter();
+    arr_iter.next();
+    let key = arr_iter.next().unwrap();
+    let temp = data_structure.list.clone();
+    let mut temp2 = temp.lock().unwrap();
+    let list = temp2.entry(key).or_insert(VecDeque::new());
+    let notify2 = notifier.clone();
+    let notify = notify2.get("list").unwrap();
+    loop {
+        match arr_iter.next() {
+            Some(val) => {
+                list.push_front(val);
+                notify.notify_waiters();
+            }
+            None => {
+                break;
+            }
+        }
+    }
+    return Some(RedisValueRef::Int(list.len() as i64));
+}
+
+fn lrange(data_structure: Arc<DataStructure>, arr: Vec<String>) -> Option<RedisValueRef> {
+    let mut arr_iter = arr.into_iter();
+    arr_iter.next();
+    let mut vec = VecDeque::new();
+    let (key, mut start, mut end) = (
+        arr_iter.next().unwrap(),
+        arr_iter.next().unwrap().parse::<i16>().unwrap(),
+        arr_iter.next().unwrap().parse::<i16>().unwrap(),
+    );
+    let temp = data_structure.list.clone();
+    let mut temp2 = temp.lock().unwrap();
+    let list = temp2.get_mut(&key).unwrap();
+    let length = list.len() as i16;
+    if start < 0 {
+        start = length + start + 1;
+    }
+    if end < 0 {
+        end = length + end + 1;
+    }
+    for i in start..end + 1 {
+        println!("{:?}", i);
+        vec.push_back(RedisValueRef::String(Bytes::copy_from_slice(
+            &list[i as usize].as_bytes(),
+        )));
+    }
+    return Some(RedisValueRef::Array(vec));
+}
+
+fn lpop(data_structure: Arc<DataStructure>, arr: Vec<String>) -> Option<RedisValueRef> {
+    let key = &arr[1];
+    let mut vec = VecDeque::new();
+    let ele = arr
+        .get(2)
+        .unwrap_or(&"1".to_string())
+        .parse::<usize>()
+        .unwrap();
+    let temp = data_structure.list.clone();
+    let mut temp2 = temp.lock().unwrap();
+    let list = temp2.get_mut(key).unwrap();
+    for _ in 0..ele {
+        vec.push_front(RedisValueRef::String(Bytes::copy_from_slice(
+            list.pop_front().unwrap().as_bytes(),
+        )));
+    }
+    return Some(RedisValueRef::Array(vec));
+}
+
+async fn blpop(
+    data_structure: Arc<DataStructure>,
+    arr: Vec<String>,
+    notifier: Arc<HashMap<String, Notify>>,
+) -> Option<RedisValueRef> {
+    let (key, timeout) = (&arr[1], arr[2].parse::<usize>().unwrap() as u64);
+    let notify2 = notifier.clone();
+    let notify = notify2.get("list").unwrap();
+    let temp = data_structure.list.clone();
+    let start = Instant::now();
+    {
+        let mut temp2 = temp.lock().unwrap();
+        temp2.entry(key.clone()).insert_entry(VecDeque::new());
+    }
+
+    if timeout.to_owned() == 0 {
+        {
+            let mut temp2 = temp.lock().unwrap();
+            let list = temp2.get_mut(key).unwrap();
+            println!("list len {:?}", list.len());
+            if list.len() > 0 as usize {
+                return Some(RedisValueRef::String(Bytes::copy_from_slice(
+                    list.pop_front().unwrap().as_bytes(),
+                )));
+            }
+        }
+        notify.notified().await;
+        {
+            let mut temp2 = temp.lock().unwrap();
+            let list = temp2.get_mut(key).unwrap();
+            return Some(RedisValueRef::String(Bytes::copy_from_slice(
+                list.pop_front().unwrap().as_bytes(),
+            )));
+        }
+    }
+    while start.elapsed() < Duration::from_secs(timeout) {
+        {
+            let mut temp2 = temp.lock().unwrap();
+            let mut list = temp2.get_mut(key).unwrap().clone();
+            if list.len() > 0 as usize {
+                return Some(RedisValueRef::String(Bytes::copy_from_slice(
+                    list.pop_front().unwrap().as_bytes(),
+                )));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    return None;
+}
+
+fn multi(
+    stack: Arc<Mutex<HashMap<String, Arc<Mutex<VecDeque<Vec<String>>>>>>>,
+    val: Vec<String>,
+    socket_id: &String,
+) {
     dbg!("Inside Multi");
-    stack.lock().unwrap().push(val);
+    let mut stack1 = stack.lock().unwrap();
+    match stack1.get(socket_id) {
+        Some(v) => {
+            v.lock().unwrap().push_back(val);
+        }
+        None => {
+            stack1.insert(socket_id.to_owned(), Arc::new(Mutex::new(VecDeque::new())));
+        }
+    }
+    // stack1
+    //     .entry(socket_id.to_owned())
+    //     .or_insert(Arc::new(Mutex::new(VecDeque::new())))
+    //     .lock()
+    //     .unwrap()
+    //     .push_back(val);
 }
 
-async fn EXEC(
+async fn exec(
     stream: &mut tokio::net::TcpStream,
-    data_structure: Arc<data_structure>,
-    notify2: Arc<Notify>,
+    data_structure: Arc<DataStructure>,
+    notify2: Arc<HashMap<String, Notify>>,
+    socket_id: &String,
 ) {
     dbg!("Inside EXEC");
     let stack1 = data_structure.stack.clone();
@@ -345,11 +577,13 @@ async fn EXEC(
     loop {
         let query;
         {
-            let mut stack = stack1.lock().unwrap();
+            let stack2 = stack1.lock().unwrap();
+            let mut stack = stack2.get(socket_id).unwrap().lock().unwrap();
+
             if stack.len() == 0 {
                 return;
             } else {
-                query = stack.pop().unwrap();
+                query = stack.pop_front().unwrap();
             }
         }
         //dbg!("query", &query);
@@ -359,17 +593,50 @@ async fn EXEC(
             data_structure.clone(),
             notify2.clone(),
             0,
+            socket_id,
         ))
         .await;
     }
 }
 
-fn XADD(
+fn incr(arr: Vec<String>, data_structure: Arc<DataStructure>) -> Option<RedisValueRef> {
+    let mut set = data_structure.hash_map.lock().unwrap();
+    match set.get_mut(&arr[1]) {
+        Some(value) => match value {
+            Value::Simple(s) => match s.parse::<i64>() {
+                Ok(v) => {
+                    set.insert(arr[1].to_owned(), Value::Simple((v + 1).to_string()));
+                    return Some(RedisValueRef::Int(v + 1));
+                }
+                Err(err) => return Some(RedisValueRef::Error(Bytes::from("1"))), //todo!
+            },
+            Value::Expiry((s, d, i)) => {
+                match s.parse::<i64>() {
+                    Ok(v) => {
+                        let (nd, ni) = (d.clone(), i.clone());
+                        set.insert(
+                            arr[1].to_owned(),
+                            Value::Expiry(((v + 1).to_string(), nd, ni)),
+                        );
+                        return Some(RedisValueRef::Int(v + 1));
+                    }
+                    Err(err) => return Some(RedisValueRef::Error(Bytes::from("1"))), //todo!
+                }
+            }
+            Value::None => return Some(RedisValueRef::Error(Bytes::from("1"))),
+        },
+        None => {
+            set.insert(arr[1].to_owned(), Value::Simple("1".to_string()));
+            return Some(RedisValueRef::Int(1));
+        }
+    }
+}
+fn xadd(
     arr: Vec<String>,
     rt: Arc<Mutex<HashMap<String, RadixTree<HashMap<String, String>>>>>,
     last_stream_id_map: Arc<Mutex<HashMap<String, String>>>,
-    notify2: Arc<Notify>,
-) {
+    notify2: Arc<HashMap<String, Notify>>,
+) -> Option<RedisValueRef> {
     let key = &arr[1];
     let mut stream_id = arr[2].clone();
     let mut temp1 = rt.lock().unwrap();
@@ -380,19 +647,18 @@ fn XADD(
             value: Some(HashMap::<String, String>::new()),
             end: false,
         }));
+    let notify2 = notify2.get("rt").unwrap();
 
     let mut last_stream_id_map = last_stream_id_map.lock().unwrap();
     let last_stream_id = last_stream_id_map
         .entry(key.to_string())
-        .or_insert(stream_id.clone());
-    if stream_id == "*".to_string() {
-        stream_id = generate_id(&stream_id, last_stream_id);
-    }
+        .or_insert("0-0".to_string());
+
+    stream_id = generate_id(&stream_id, last_stream_id);
     if !verify_stream(&stream_id, &last_stream_id) {
         println!("last stream id is greater than curr");
-        //return false;
+        return None;
     }
-    todo!("add support for partial streamid");
 
     let mut val: HashMap<String, String> = HashMap::new();
 
@@ -403,134 +669,226 @@ fn XADD(
     if stream_id > last_stream_id_map[key] {
         last_stream_id_map.insert(key.to_string(), stream_id.clone());
     }
-    rt.insert(stream_id, val);
-    notify2.notify_one();
+    rt.insert(stream_id.clone(), val);
+    notify2.notify_waiters();
     println!(
         "radix tree from main HIIII {:#?} also last_stream_id_Map {:?}",
         rt, last_stream_id_map
     );
+    return Some(RedisValueRef::String(Bytes::copy_from_slice(
+        stream_id.as_bytes(),
+    )));
 }
 
-fn XRANGE(arr: Vec<String>, rt: Arc<Mutex<HashMap<String, RadixTree<HashMap<String, String>>>>>) {
+fn xrange(
+    arr: Vec<String>,
+    rt: Arc<Mutex<HashMap<String, RadixTree<HashMap<String, String>>>>>,
+) -> Option<RedisValueRef> {
     let key = &arr[1];
     let temp1 = rt.lock().unwrap();
     let rt = temp1.get(key).unwrap();
-    let (mut start, mut end) = (&arr[2], &arr[3]);
-    let (k1, k2) = ("000000000000-0".to_string(), "999999999999-9".to_string());
+    let (mut start, mut end) = (arr[2].clone(), arr[3].clone());
+    let (k1, k2) = ("0-0".to_string(), "999999999999-9".to_string());
     if start == "-" {
-        start = &k1;
+        start = k1;
     }
     if end == "+" {
-        end = &k2;
+        end = k2;
     }
-
-    let mut res: Vec<_> = Vec::new();
-    radix_tree::RadixTree::search_in_range(&rt.root, start, end, "".to_string(), &mut res);
-    println!("{:?}", res);
+    if !start.contains("-") {
+        start.push_str("-0");
+    }
+    if !end.contains("-") {
+        end.push_str("-0");
+    }
+    let mut buffer: Vec<_> = Vec::new();
+    radix_tree::RadixTree::search_in_range(
+        &rt.root,
+        &start,
+        &end,
+        "".to_string(),
+        &mut buffer,
+        start.len(),
+        end.len(),
+    );
+    println!("inside xread arr={:?}", buffer);
+    return Some(vec_to_redis_value_ref(buffer));
 }
 
-async fn XREAD(
+fn vec_to_redis_value_ref(buffer: Vec<StreamRes<String>>) -> RedisValueRef {
+    let mut res = VecDeque::new();
+    for v in buffer {
+        match v {
+            StreamRes::One(a) => {
+                res.push_back(RedisValueRef::Array(VecDeque::from([
+                    RedisValueRef::String(Bytes::from_owner(a.into_bytes())),
+                ])));
+            }
+            StreamRes::Two((a, b)) => {
+                if let RedisValueRef::Array(vec) = res.get_mut(res.len() - 1).unwrap() {
+                    vec.push_back(RedisValueRef::Array(VecDeque::from([
+                        RedisValueRef::String(Bytes::from(a.into_bytes())),
+                        RedisValueRef::String(Bytes::from(b.into_bytes())),
+                    ])));
+                }
+            }
+        }
+    }
+    println!("inside vec_to_redis_value_ref {:?}", res);
+    return RedisValueRef::Array(res);
+}
+
+async fn xread(
     arr: Vec<String>,
     rt: Arc<Mutex<HashMap<String, RadixTree<HashMap<String, String>>>>>,
     last_stream_id_map: Arc<Mutex<HashMap<String, String>>>,
-    notify2: Arc<Notify>,
-) {
+    notify2: Arc<HashMap<String, Notify>>,
+) -> Option<RedisValueRef> {
     println!("Inside XREAD");
     //let temp1 = rt.lock().unwrap();
     //let mut res = Vec::new();
+    let mut res = Vec::new();
 
     if arr[1] == "BLOCK" {
         println!("inside block of xread");
-        let (key, blocking_time) = (&arr[4], &arr[2]);
+        let key = &arr[4];
         let given_stream_id;
+        let notify2 = notify2.get("rt").unwrap();
         //let rt = rt.lock().unwrap().get(key).unwrap();
         {
             let last_stream_id = last_stream_id_map.lock().unwrap();
             if arr[5] == "$" {
-                given_stream_id = last_stream_id[key].clone();
+                let mut splitted: Vec<String> = last_stream_id[key]
+                    .clone()
+                    .split("-")
+                    .map(|a| a.to_string())
+                    .collect();
+                // given_stream_id = .1.parse;
+                let k = (splitted[1]
+                    .parse::<usize>()
+                    .expect("unable to parse it as usize")
+                    + 1)
+                .to_string();
+                splitted[0].push_str(k.as_str());
+                given_stream_id = splitted[0].clone();
             } else {
                 given_stream_id = arr[5].clone();
             }
         }
+
         let time = Duration::new(arr[2].parse::<u64>().unwrap(), 0);
         let start_time = SystemTime::now();
+
         if time == Duration::new(0, 0) {
-            loop {
-                println!("inside duration of 0 for xread block");
+            println!("inside duration of 0 for xread block");
+            {
+                let last_stream_id = last_stream_id_map.lock().unwrap().get(key).unwrap().clone();
+                if last_stream_id <= given_stream_id {
+                    println!(
+                        "inside yield_now() of duration of 0 for xread block, last_stream_id{:?} and given_stream_id:{:?}",
+                        last_stream_id, given_stream_id
+                    );
+                    //yield_now();
+                    notify2.notified().await;
+                }
                 {
-                    let lastStreamId = last_stream_id_map.lock().unwrap().get(key).unwrap().clone();
-                    if lastStreamId <= given_stream_id {
-                        println!(
-                            "inside yield_now() of duration of 0 for xread block, last_stream_id{:?} and given_stream_id:{:?}",
-                            lastStreamId, given_stream_id
-                        );
-                        //yield_now();
-                        notify2.notified().await;
-                    } else {
-                        println!("else break");
-                        break;
-                    }
+                    let temp1 = rt.lock().unwrap();
+                    let rt = temp1.get(key).unwrap();
+                    let end = "99999999999-9";
+                    radix_tree::RadixTree::search_in_range(
+                        &rt.root,
+                        &given_stream_id,
+                        &end,
+                        "".to_string(),
+                        &mut res,
+                        given_stream_id.len(),
+                        end.len(),
+                    );
                 }
             }
         } else {
             while SystemTime::now().duration_since(start_time).unwrap() < time {
                 {
-                    let lastStreamId = last_stream_id_map.lock().unwrap();
                     {
-                        println!("inside duration of non zero for xread block ");
-                        if lastStreamId[key] <= given_stream_id {
-                            tokio::time::sleep(Duration::new(0, 100));
-                        } else {
-                            println!(
-                                "FINALLY GOT A VALUE FROM ANOTHER CLIENT WHILE BLOCKED BABYYYY. and it is ",
-                                //res
-                            );
-
-                            //todo!("write res to stream");
-                            break;
+                        let last_stream_id = last_stream_id_map.lock().unwrap();
+                        {
+                            //println!("inside duration of non zero for xread block ");
+                            if last_stream_id[key] >= given_stream_id {
+                                {
+                                    let temp1 = rt.lock().unwrap();
+                                    let rt = temp1.get(key).unwrap();
+                                    let end = "99999999999-9";
+                                    radix_tree::RadixTree::search_in_range(
+                                        &rt.root,
+                                        &given_stream_id,
+                                        &end,
+                                        "".to_string(),
+                                        &mut res,
+                                        given_stream_id.len(),
+                                        end.len(),
+                                    );
+                                    break;
+                                }
+                            }
                         }
                     }
+                    tokio::time::sleep(Duration::new(0, 100)).await;
                 }
             }
         }
     } else {
         println!("inside non block section of xread");
         let length = arr.len();
-        let mut res = Vec::new();
-        for i in 2..length / 2 + 2 {
+        for i in 2..length / 2 + 1 {
             {
                 let temp = rt.lock().unwrap();
                 let rt = temp.get(&arr[i]).unwrap();
+                let end = "99999999999-9";
                 RadixTree::search_in_range(
                     &rt.root,
-                    &arr[i / 2 + 2 + i],
-                    &"99999999999-9",
+                    &arr[i + (length - 2) / 2],
+                    &end,
                     "".to_string(),
                     &mut res,
+                    arr[i + (length - 2) / 2].len(),
+                    end.len(),
                 );
             }
         }
     }
+    if res.len() > 0 {
+        return Some(vec_to_redis_value_ref(res));
+    } else {
+        return Some(RedisValueRef::NullArray);
+    }
+}
+
+fn discard(data_structure: Arc<DataStructure>, socket_id: &String) {
+    let mut stack1 = data_structure.stack.lock().unwrap();
+    let mut stack = stack1.get_mut(socket_id).unwrap().lock().unwrap();
+    //let mut stack = stack1.lock().unwrap();
+    println!("stack {:?}", stack);
+    stack.clear();
 }
 
 async fn process(
-    mut stream1: Option<tokio::net::TcpStream>,
-    data_structure: Option<Arc<data_structure>>,
-    notify21: Option<Arc<Notify>>,
+    stream1: Option<tokio::net::TcpStream>,
+    data_structure: Option<Arc<DataStructure>>,
+    notifier: Option<Arc<HashMap<String, Notify>>>,
+    socket_id: String,
 ) {
     dbg!("inside process function");
-    let decoded = Bytes::new();
     let mut buf = BytesMut::zeroed(512);
     println!("outer loop");
-    let mut last_stream_id = "000000000-0".to_string();
     println!("inside tokyo");
-    let (mut stream, data_structure, notify2) =
-        (stream1.unwrap(), data_structure.unwrap(), notify21.unwrap());
+    let (mut stream, data_structure, notifier) = (
+        stream1.unwrap(),
+        data_structure.unwrap(),
+        notifier.unwrap().clone(),
+    );
 
-    let mut stack = Vec::<String>::new();
     let mut state = 0;
     loop {
-        let mut res = BytesMut::zeroed(512);
         let length: usize = stream.read(&mut buf).await.unwrap();
         println!(" same client buffer {:?}", buf);
 
@@ -549,18 +907,9 @@ async fn process(
             arr.push(s.to_string());
         }
         println!("{:?} arr for sanity", arr);
-        //println!("buf read babyyy{:?}", splited2);
-        // println!("{:?},{:?},{:?}", &buf, &buf[..length], b'*');
-        // println!("hola,{:?}", parse(&buf, 0));
 
-        // let temp = parse(&buf, 0)
-        //     .expect("error from 2")
-        //     .unwrap()
-        //     .1
-        //     .redis_value(&buf.clone().freeze());
         if arr[0] == "MULTI" {
             state = 1;
-            continue;
         }
         if arr[0] == "EXEC" {
             state = 0;
@@ -570,8 +919,9 @@ async fn process(
             &mut stream,
             arr,
             data_structure.clone(),
-            notify2.clone(),
+            notifier.clone(),
             state,
+            &socket_id,
         )
         .await;
         //buf.clear();
@@ -581,21 +931,26 @@ async fn process(
 async fn logic(
     stream: &mut tokio::net::TcpStream,
     arr: Vec<String>,
-    data_structure: Arc<data_structure>,
-    notify2: Arc<Notify>,
+    data_structure: Arc<DataStructure>,
+    notifier: Arc<HashMap<String, Notify>>,
     state: u32,
+    socket_id: &String,
 ) {
-    let (rt, hashSet, HashMap, last_stream_id_map, stack) = (
+    let (rt, _hash_set, _hash_map, last_stream_id_map, stack) = (
         data_structure.rt.clone(),
         data_structure.set.clone(),
-        data_structure.hashMap.clone(),
+        data_structure.hash_map.clone(),
         data_structure.last_stream_id_map.clone(),
         data_structure.stack.clone(),
     );
     dbg!("inside logic function,state arr", state, &arr);
     if state == 1 {
         dbg!("stack", &stack);
-        MULTI(stack, arr);
+        if arr[0].as_str() == "DISCARD" {
+            discard(data_structure, socket_id);
+        } else {
+            multi(stack, arr, socket_id);
+        }
         return;
     }
     match arr[0].as_str() {
@@ -603,325 +958,110 @@ async fn logic(
             println!("inside echo");
             stream.write(&arr[1].as_bytes()).await.unwrap();
         }
-        // "GET" => {
-        //     let response1 = {
-        //         let temp1 = temp2.lock().unwrap();
-        //         println!("{:?}", temp1);
-        //         match temp1.get(&RedisValueRef::String(Bytes::from(arr[1].clone()))) {
-        //             Some(val) => match val {
-        //                 value::Simple(val) => {
-        //                     encode(val, &mut res);
-        //                     KeyValue::Some(res.freeze().clone())
-        //                     //stream.write(&res).await.unwrap();
-        //                 }
-        //                 value::Expiry((val, time)) => {
-        //                     {
-        //                         if &SystemTime::now()
-        //                             .duration_since(UNIX_EPOCH)
-        //                             .unwrap()
-        //                             .as_millis()
-        //                             > time
-        //                         {
-        //                             temp1.get(&RedisValueRef::String(Bytes::from(
-        //                                 arr[1].clone(),
-        //                             )));
-        //                         } else {
-        //                             encode(val, &mut res);
-        //                         }
-        //                         KeyValue::Some(res.freeze())
-        //                     }
-        //                     //stream.write(&res).await.unwrap();
-        //                 }
-        //             },
-        //             None => {
-        //                 KeyValue::None
 
-        //                 //stream.write(b"$-1\r\n").await.unwrap();
-        //             }
-        //         }
-        //     };
-        //     match response1 {
-        //         KeyValue::Some(val) => {
-        //             stream.write(&val).await.unwrap();
-        //         }
+        "GET" => {
+            let temp = get(data_structure, arr);
+            if let Some(val) = temp {
+                stream_write(val, stream).await;
+            }
+        }
 
-        //         _ => {
-        //             stream.write(b"$-1\r\n").await.unwrap();
-        //         }
-        //     };
-        // }
-        // "SET" => {
-        //     println!("inside SET");
+        "SET" => {
+            let temp = set(data_structure, arr);
+            if let Some(val) = temp {
+                stream_write(val, stream).await;
+            }
+        }
 
-        //     {
-        //         let mut temp1 = temp2.lock().unwrap();
-        //         if arr.len() > 3 {
-        //             let time = match &RedisValueRef::String(Bytes::from(arr[4])) {
-        //                 RedisValueRef::String(b) => {
-        //                     String::from_utf8_lossy(&b).to_string()
-        //                 }
-        //                 _ => "0".to_string(),
-        //             };
-        //             let time_required: u128 = SystemTime::now()
-        //                 .duration_since(UNIX_EPOCH)
-        //                 .unwrap()
-        //                 .as_millis()
-        //                 + time.parse::<u128>().unwrap();
-        //             //let temp = hash_map.lock().unwrap();
-        //             temp1.insert(
-        //                 RedisValueRef::String(Bytes::from(arr[1])),
-        //                 value::Expiry((
-        //                     RedisValueRef::String(Bytes::from(arr[2])),
-        //                     time_required,
-        //                 )),
-        //             );
-        //         } else {
-        //             println!("inside else case");
-        //             temp1.insert(
-        //                 RedisValueRef::String(Bytes::from(arr[1])),
-        //                 value::Simple(RedisValueRef::String(Bytes::from(arr[2]))),
-        //             );
-        //             //stream.write(b"OK").await.unwrap();
-        //         }
-        //         //println!("hash_map{:?}", hash_map);
-        //     }
-        //     stream.write(b"OK").await.unwrap();
-        // }
-        // "RPUSH" => {
-        //     let mut temp1 = temp2.lock().unwrap();
-        //     let temp = temp1.get_mut(&arr[1]);
-        //     let ans;
-        //     let list = match temp {
-        //         Some(list) => list,
-        //         None => {
-        //             temp1.insert(
-        //                 arr[1].clone(),
-        //                 value::Simple(RedisValueRef::Array(VecDeque::new())),
-        //             );
-        //             temp1.get_mut(&arr[1]).unwrap()
-        //         }
-        //     };
-        //     if let value::Simple(list1) = list {
-        //         if let RedisValueRef::Array(list2) = list1 {
-        //             for i in 2..arr.len() {
-        //                 list2.push_back(arr[i].clone());
-        //             }
-        //         }
-        //     }
-        //     ans = temp1.get(&arr[1].clone()).unwrap();
-        //     println!("hellooooooooooo {:?}", ans);
-        // }
+        "RPUSH" => {
+            let temp = rpush(data_structure, arr, notifier);
+            if let Some(val) = temp {
+                stream_write(val, stream).await;
+            }
+        }
 
-        // "LPUSH" => {
-        //     let mut res = 0;
-        //     let mut actual = BytesMut::new();
-        //     {
-        //         let mut temp1 = temp2.lock().unwrap();
-        //         let list = temp1.get_mut(&arr[1]).unwrap();
-        //         if let value::Simple(list1) = list {
-        //             if let RedisValueRef::Array(list2) = list1 {
-        //                 for i in 2..arr.len() {
-        //                     list2.push_front(arr[i].clone());
-        //                 }
-        //                 res = list2.len();
-        //             }
-        //         }
-        //     }
-        //     encode(&RedisValueRef::Int(res as i64), &mut actual);
-        //     stream.write(&actual).await;
-        // }
+        "LPUSH" => {
+            let temp = lpush(data_structure, arr, notifier);
+            if let Some(val) = temp {
+                stream_write(val, stream).await;
+            }
+        }
 
-        // "LLEN" => {
-        //     let mut res = BytesMut::new();
-        //     let mut ans = 0;
-        //     {
-        //         let mut temp1 = temp2.lock().unwrap();
-        //         let list = temp1.get(&arr[1]);
-        //         match list {
-        //             Some(val) => match val {
-        //                 value::Expiry((list, exp)) => match list {
-        //                     RedisValueRef::Array(arr) => ans = arr.len() as i32,
-        //                     _ => (),
-        //                 },
-        //                 value::Simple(list) => match list {
-        //                     RedisValueRef::Array(arr) => ans = arr.len() as i32,
-        //                     _ => (),
-        //                 },
-        //             },
-        //             None => (),
-        //         }
-        //     }
-        //     encode(&RedisValueRef::Int(ans.into()), &mut res);
-        //     stream.write(&res).await;
-        // }
-        // "LRANGE" => {
-        //     let mut res = BytesMut::new();
-        //     {
-        //         let mut temp1 = temp2.lock().unwrap();
-        //         let temp = temp1.get_mut(&arr[1]).unwrap();
-        //         let mut temp_list = VecDeque::new();
-        //         let mut list = &mut temp_list;
-        //         match temp {
-        //             value::Simple(val) => match val {
-        //                 RedisValueRef::Array(real_list) => {
-        //                     list = real_list;
-        //                 }
-        //                 _ => {}
-        //             },
-        //             value::Expiry((val, time)) => match val {
-        //                 RedisValueRef::Array(real_list) => {
-        //                     list = real_list;
-        //                 }
-        //                 _ => {}
-        //             },
-        //         }
-        //         let mut start;
-        //         let mut end;
-        //         let total = list.len() as i64;
-        //         println!("array two {:?}, total {:?}", arr[2], total);
-        //         if let RedisValueRef::Int(i) = arr[2] {
-        //             start = i;
-        //         } else {
-        //             start = total + 1;
-        //         }
-        //         if let RedisValueRef::Int(j) = arr[3] {
-        //             end = j;
-        //         } else {
-        //             end = total + 1;
-        //         }
+        "LLEN" => {
+            let key = &arr[1];
+            let temp = data_structure.list.clone();
+            let mut temp2 = temp.lock().unwrap();
+            let list = temp2.get_mut(key).unwrap();
+            list.len();
+        }
 
-        //         if start.abs() > total || end.abs() > total {
-        //             println!("if case")
-        //         } else {
-        //             if start < 0 && start.abs() <= total {
-        //                 start = total + start;
-        //             }
-        //             if end < 0 && end.abs() <= total {
-        //                 end = total + end;
-        //             }
-        //             println!("start :{:?} ,end :{:?}", start, end);
-        //             if start < end {
-        //                 list.make_contiguous();
-        //                 let (front, back) = list.as_slices();
-        //                 encode(
-        //                     &RedisValueRef::Array(VecDeque::from(
-        //                         front.to_vec()[start as usize..end as usize].to_owned(),
-        //                     )),
-        //                     &mut res,
-        //                 );
-        //             }
-        //         }
-        //     }
-        //     println!("inside lrange");
-        //     stream.write(&res).await.unwrap();
-        // }
+        "LRANGE" => {
+            let temp = lrange(data_structure, arr);
+            if let Some(val) = temp {
+                stream_write(val, stream).await;
+            }
+        }
 
-        // "LPOP" => {
-        //     let mut ans = RedisValueRef::NullBulkString;
-        //     let mut res = BytesMut::new();
-        //     {
-        //         let mut temp1 = temp2.lock().unwrap();
-        //         let list2 = temp1.get_mut(&arr[1]).unwrap();
-        //         if let value::Simple(list1) = list2 {
-        //             if let RedisValueRef::Array(list2) = list1 {
-        //                 match list2.pop_front() {
-        //                     Some(num) => ans = num,
-        //                     None => ans = RedisValueRef::NullBulkString,
-        //                 }
-        //             }
-        //         }
-        //     }
-        //     encode(&ans, &mut res);
-        //     stream.write(&res).await;
-        // }
+        "LPOP" => {
+            let temp = lpop(data_structure, arr);
+            if let Some(val) = temp {
+                stream_write(val, stream).await;
+            }
+        }
 
-        // "BLPOP" => {
-        //     let mut res = BytesMut::new();
-        //     let mut res1 = RedisValueRef::NullArray;
-        //     let mut time_required = 200 as u64;
-        //     let curr = SystemTime::now();
-        //     if let RedisValueRef::Int(t) = arr[1] {
-        //         time_required = t as u64
-        //     }
+        "BLPOP" => {
+            let temp = blpop(data_structure, arr, notifier).await;
+            if let Some(val) = temp {
+                stream_write(val, stream).await;
+            }
+        }
 
-        //     loop {
-        //         if SystemTime::now().duration_since(curr).unwrap().as_secs()
-        //             > time_required
-        //         {
-        //             break;
-        //         }
-        //         {
-        //             let mut temp1 = temp2.lock().unwrap();
-        //             let temp = temp1.get_mut(&arr[1]).unwrap();
-        //             let mut temp_list = VecDeque::new();
-        //             let mut list = &mut temp_list;
-
-        //             match temp {
-        //                 value::Simple(val) => match val {
-        //                     RedisValueRef::Array(real_list) => {
-        //                         list = real_list;
-        //                     }
-        //                     _ => {}
-        //                 },
-        //                 value::Expiry((val, time)) => match val {
-        //                     RedisValueRef::Array(real_list) => {
-        //                         list = real_list;
-        //                     }
-        //                     _ => {}
-        //                 },
-        //             }
-        //             if list.len() > 0 {
-        //                 res1 = list.pop_front().unwrap();
-        //                 break;
-        //             }
-        //         }
-        //         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        //     }
-        //     encode(&res1, &mut res);
-        //     stream.write(&res).await.unwrap();
-        // }
-        // "TYPE" => {
-        //     let temp1 = temp2.lock().unwrap();
-        //     let temp = temp1.get(&arr[1]).unwrap();
-        //     //match value {}
-        // }
         "XADD" => {
-            XADD(arr, rt.clone(), last_stream_id_map.clone(), notify2.clone());
-            // let mut temp1 = temp2.lock().unwrap();
-            // let temp = temp1.get(&arr[1]);
-            // match temp {
-            //     Some(val) => {}
-            //     None => {
-            //         let mut map = BTreeMap::new();
-            //         map.insert(
-            //             RedisValueRef::String(Bytes::from(
-            //                 "stream-key",
-            //             )),
-            //             RedisValueRef::String(Bytes::from(
-            //                 "nothing for now",
-            //             )),
-            //         );
-            //         temp1.insert(
-            //             arr[1].clone(),
-            //             value::Simple(RedisValueRef::Stream(map)),
-            //         );
-            //     }
-            // }
+            let temp = xadd(
+                arr,
+                rt.clone(),
+                last_stream_id_map.clone(),
+                notifier.clone(),
+            );
+            if let Some(val) = temp {
+                stream_write(val, stream).await;
+            }
         }
         "XRANGE" => {
-            XRANGE(arr, rt.clone());
+            let temp = xrange(arr, rt.clone());
+            if let Some(val) = temp {
+                stream_write(val, stream).await;
+            }
         }
 
         "XREAD" => {
-            XREAD(arr, rt.clone(), last_stream_id_map.clone(), notify2.clone()).await;
+            let temp = xread(
+                arr,
+                rt.clone(),
+                last_stream_id_map.clone(),
+                notifier.clone(),
+            )
+            .await;
+            if let Some(val) = temp {
+                stream_write(val, stream).await;
+            }
+        }
+        "INCR" => {
+            let temp = incr(arr, data_structure);
+            if let Some(val) = temp {
+                stream_write(val, stream).await;
+            }
         }
 
         "MULTI" => {
-            MULTI(stack.clone(), arr);
+            multi(stack.clone(), arr, socket_id);
         }
 
         "EXEC" => {
-            EXEC(stream, data_structure, notify2).await;
+            exec(stream, data_structure, notifier, socket_id).await;
+        }
+        "DISCARD" => {
+            discard(data_structure, socket_id);
         }
         _ => {}
     }
@@ -932,39 +1072,33 @@ async fn main() {
     println!("{:?}", Bytes::from("Hello, world!"));
 
     let listener = TcpListener::bind("127.0.0.1:9092").await.unwrap();
-    let hash_map: Arc<Mutex<HashMap<RedisValueRef, value>>> = Arc::new(Mutex::new(HashMap::new()));
-    let list: Arc<Mutex<VecDeque<RedisValueRef>>> = Arc::new(Mutex::new(VecDeque::new()));
-    //let hash_set = Arc::new(Mutex::new(HashSet::new()));
-    let radix_tree_root_node = radix_tree::RadixTreeNode {
-        children: HashMap::new(),
-        value: Some(HashMap::<String, String>::new()),
-        end: false,
-    };
-    let radix_tree_map = Arc::new(Mutex::new(HashMap::new()));
-    //let radix_tree = Arc::new(Mutex::new(radix_tree::RadixTree::new(radix_tree_root_node)));
-    //let last_stream_id_map = Arc::new(Mutex::new(HashMap::new()));
-    let notify = Arc::new(Notify::new());
-    let data_structure = Arc::new(data_structure {
+    let notifier = Arc::new(HashMap::from([
+        ("rt".to_owned(), Notify::new()),
+        ("list".to_owned(), Notify::new()),
+    ]));
+    let data_structure = Arc::new(DataStructure {
         rt: Arc::new(Mutex::new(HashMap::new())),
         set: Arc::new(Mutex::new(HashSet::new())),
-        hashMap: Arc::new(Mutex::new((HashMap::new()))),
+        hash_map: Arc::new(Mutex::new(HashMap::new())),
         last_stream_id_map: Arc::new(Mutex::new(HashMap::new())),
-        stack: Arc::new(Mutex::new(Vec::new())),
+        stack: Arc::new(Mutex::new(HashMap::new())),
+        list: Arc::new(Mutex::new(HashMap::new())),
     });
 
     loop {
-        let mut stream = listener.accept().await.unwrap().0;
-        let temp2 = hash_map.clone();
-        let rt: Arc<Mutex<HashMap<String, RadixTree<HashMap<String, String>>>>> =
-            radix_tree_map.clone();
-        //let last_stream_id_map = last_stream_id_map.clone();
-        let notify2 = notify.clone();
-        //let hash_set2 = hash_set.clone();
+        let (stream, socket_id) = listener.accept().await.unwrap();
+        let notifier = notifier.clone();
         let data_structure = data_structure.clone();
 
         tokio::spawn(async move {
             //let mut buf = [0; 512];
-            process(Some(stream), Some(data_structure), Some(notify2)).await;
+            process(
+                Some(stream),
+                Some(data_structure),
+                Some(notifier),
+                socket_id.to_string(),
+            )
+            .await;
         });
     }
 }
