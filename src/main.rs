@@ -4,7 +4,6 @@ use memchr::memchr;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::hash::Hash;
-use tokio::stream;
 
 //use std::convert::From;
 use library::radix_tree::{self, RadixTree, RadixTreeNode, StreamRes};
@@ -13,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-//use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
 type RedisResult = Result<Option<(usize, RedisBufSplit)>, RESPError>;
@@ -557,12 +555,6 @@ fn multi(
             stack1.insert(socket_id.to_owned(), Arc::new(Mutex::new(VecDeque::new())));
         }
     }
-    // stack1
-    //     .entry(socket_id.to_owned())
-    //     .or_insert(Arc::new(Mutex::new(VecDeque::new())))
-    //     .lock()
-    //     .unwrap()
-    //     .push_back(val);
 }
 
 async fn exec(
